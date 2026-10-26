@@ -483,6 +483,20 @@ pub const CLASSES: ClassExports = objc_classes! {
         kEAGLRenderingAPIOpenGLES2 => create_gles2_ctx(env),
         _ => create_gles1_ctx(env),
     };
+    let mut gles_ins = match gles_ins {
+        Ok(gles_ins) => gles_ins,
+        Err(err) => {
+            env.window
+                .as_mut()
+                .unwrap()
+                .set_share_with_current_context(false);
+            log!(
+                "Returning nil as no OpenGL ES context could be created: {}",
+                err
+            );
+            return nil;
+        }
+    };
 
     let window = env.window.as_mut().expect("OpenGL ES is not supported in headless mode");
     let drawable_framebuffer = {
@@ -532,6 +546,16 @@ pub const CLASSES: ClassExports = objc_classes! {
         kEAGLRenderingAPIOpenGLES3 => create_gles3_ctx(env),
         kEAGLRenderingAPIOpenGLES2 => create_gles2_ctx(env),
         _ => create_gles1_ctx(env),
+    };
+    let mut gles_ins = match gles_ins {
+        Ok(gles_ins) => gles_ins,
+        Err(err) => {
+            log!(
+                "Returning nil as no OpenGL ES context could be created: {}",
+                err
+            );
+            return nil;
+        }
     };
 
     let window = env.window.as_mut().expect("OpenGL ES is not supported in headless mode");

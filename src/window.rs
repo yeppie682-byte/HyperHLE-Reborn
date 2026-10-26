@@ -779,6 +779,14 @@ pub fn host_screen_size() -> Option<(u32, u32)> {
     }
 }
 
+/// Whether `configure_android_angle_driver` has staged the bundled ANGLE
+/// libraries for the upcoming SDL initialization.
+fn android_angle_driver_staged() -> bool {
+    matches!(
+        env::var("SDL_VIDEO_EGL_DRIVER").as_deref(),
+        Ok("libEGL_angle.so") | Ok("libEGL_angle_in_apk.so")
+    )
+}
 /// Configure the host OpenGL ES driver on Android.
 ///
 /// This runs before creating an SDL window/context, because SDL loads EGL and
@@ -1072,8 +1080,27 @@ impl Window {
         if env::consts::OS == "android" {
             // It's important to set context version BEFORE window creation
             // ref. https://wiki.libsdl.org/SDL2/SDL_GLattr
+            //
+            // When the bundled ANGLE driver is used, request an OpenGL ES
+            // 3.0 context for the window. SDL chooses the window's EGL
+            // config once, at window creation, using these attributes and
+            // then reuses that config for every later context creation
+            // (SDL_EGL_CreateContext does not re-run SDL_EGL_ChooseConfig).
+            // ANGLE validates eglCreateContext against the config's
+            // EGL_RENDERABLE_TYPE and fails with EGL_BAD_MATCH when an ES
+            // 3.0 context is requested on a config that doesn't advertise
+            // EGL_OPENGL_ES3_BIT (see ValidateCreateContext in ANGLE's
+            // validationEGL.cpp). Apps that ask for ES 3.0 after the window
+            // was created with ES 1.1 attributes would therefore always
+            // fail. ES 1.1 and ES 2.0 contexts remain usable on an ES 3.0
+            // config: ANGLE's frontend advertises ES 1 support on all
+            // configs, and ES 2 support is a subset of ES 3.
             let attr = video_ctx.gl_attr();
-            attr.set_context_version(1, 1);
+            if android_angle_driver_staged() {
+                attr.set_context_version(3, 0);
+            } else {
+                attr.set_context_version(1, 1);
+            }
             attr.set_context_profile(sdl2::video::GLProfile::GLES);
 
             // Disable blocking of event loop when app is paused.
@@ -1167,7 +1194,11 @@ impl Window {
             // Sanity check
             let gl_attr = video_ctx.gl_attr();
             debug_assert_eq!(gl_attr.context_profile(), sdl2::video::GLProfile::GLES);
-            debug_assert_eq!(gl_attr.context_version(), (1, 1));
+            if android_angle_driver_staged() {
+                debug_assert_eq!(gl_attr.context_version(), (3, 0));
+            } else {
+                debug_assert_eq!(gl_attr.context_version(), (1, 1));
+            }
         }
 
         if let Some(icon) = icon {

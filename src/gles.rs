@@ -1574,16 +1574,22 @@ pub fn create_gles1_translator_ctx(env: &mut Environment) -> Box<dyn GLESContext
     })
 }
 
-/// Try to create an OpenGL ES 1.1 context using the configured strategies,
-/// panicking on failure.
-pub fn create_gles1_ctx(env: &mut Environment) -> Box<dyn GLESContext> {
+/// Try to create an OpenGL ES 1.1 context using the configured strategies.
+/// Returns an error if no strategy can provide a context; the caller decides
+/// whether that is fatal (the internal context) or not (an app's EAGL
+/// context, where iOS returns nil).
+pub fn create_gles1_ctx(env: &mut Environment) -> Result<Box<dyn GLESContext>, String> {
     env.on_parent_stack_in_coroutine(|window, options| {
-        create_gles1_ctx_no_parent_stack(window, options).unwrap_or_else(|err| panic!("{}", err))
+        create_gles1_ctx_no_parent_stack(window, options)
     })
 }
 
-/// Try to create an OpenGL ES 2.0 context, panicking on failure.
+/// Try to create an OpenGL ES 2.0 context, returning an error on failure.
 ///
+/// The error is not fatal for app-created EAGL contexts: on iOS,
+/// `+[EAGLContext]` creation simply fails and the app is expected to fall
+/// back to a lower API (see the `initWithAPI:` implementation in the EAGL
+/// module).
 /// The preference order, from "most-correct" to "only as a last resort":
 ///
 /// 1. [`GLES2NativeContext`] — a real OpenGL ES 2.0 driver. This is the
@@ -1602,7 +1608,7 @@ pub fn create_gles1_ctx(env: &mut Environment) -> Box<dyn GLESContext> {
 ///    OpenGL 2.1 compatibility profile context. Only used on the rare host
 ///    that has GL 2.1 compat but no GL 3.3 Core (e.g. very old macOS
 ///    installations); kept around for backwards compatibility.
-pub fn create_gles2_ctx(env: &mut Environment) -> Box<dyn GLESContext> {
+pub fn create_gles2_ctx(env: &mut Environment) -> Result<Box<dyn GLESContext>, String> {
     env.on_parent_stack_in_coroutine(|window, options| {
         assert!(window.on_main_stack());
         log!("Creating an OpenGL ES 2.0 context:");
@@ -1651,21 +1657,26 @@ pub fn create_gles2_ctx(env: &mut Environment) -> Box<dyn GLESContext> {
                     }
                 }
             })
-            .expect("Couldn't create OpenGL ES 2.0 context")
         };
 
-        if options.trace_gl_errors {
-            Box::new(LoggingGLESContext {
-                inner: ctx,
-                verbose: options.trace_gl_errors || options.verbose_gles,
-            })
-        } else {
-            ctx
-        }
+        let ctx = ctx
+            .ok_or_else(|| "Couldn't create OpenGL ES 2.0 context".to_string())
+            .map(|ctx| {
+                if options.trace_gl_errors {
+                    Box::new(LoggingGLESContext {
+                        inner: ctx,
+                        verbose: options.trace_gl_errors || options.verbose_gles,
+                    }) as Box<dyn GLESContext>
+                } else {
+                    ctx
+                }
+            });
+
+        ctx
     })
 }
 
-/// Try to create an OpenGL ES 3.0 context, panicking on failure.
+/// Try to create an OpenGL ES 3.0 context, returning an error on failure.
 ///
 /// This is the entry point used by [crate::frameworks::opengles::eagl] when
 /// `EAGLContext initWithAPI:` is called with `kEAGLRenderingAPIOpenGLES3` (=
@@ -1673,7 +1684,7 @@ pub fn create_gles2_ctx(env: &mut Environment) -> Box<dyn GLESContext> {
 /// on Android and on desktop drivers configured for an ES context — and
 /// falls back to the desktop GL 3.3 Core translation backend on hosts
 /// without a native ES 3.0 driver (most x86 Linux/macOS desktops).
-pub fn create_gles3_ctx(env: &mut Environment) -> Box<dyn GLESContext> {
+pub fn create_gles3_ctx(env: &mut Environment) -> Result<Box<dyn GLESContext>, String> {
     env.on_parent_stack_in_coroutine(|window, options| {
         assert!(window.on_main_stack());
         log!("Creating an OpenGL ES 3.0 context:");
@@ -1706,17 +1717,22 @@ pub fn create_gles3_ctx(env: &mut Environment) -> Box<dyn GLESContext> {
                     }
                 }
             })
-            .expect("Couldn't create OpenGL ES 3.0 context")
         };
 
-        if options.trace_gl_errors {
-            Box::new(LoggingGLESContext {
-                inner: ctx,
-                verbose: options.trace_gl_errors || options.verbose_gles,
-            })
-        } else {
-            ctx
-        }
+        let ctx = ctx
+            .ok_or_else(|| "Couldn't create OpenGL ES 3.0 context".to_string())
+            .map(|ctx| {
+                if options.trace_gl_errors {
+                    Box::new(LoggingGLESContext {
+                        inner: ctx,
+                        verbose: options.trace_gl_errors || options.verbose_gles,
+                    }) as Box<dyn GLESContext>
+                } else {
+                    ctx
+                }
+            });
+
+        ctx
     })
 }
 
