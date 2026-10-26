@@ -1081,26 +1081,22 @@ impl Window {
             // It's important to set context version BEFORE window creation
             // ref. https://wiki.libsdl.org/SDL2/SDL_GLattr
             //
-            // When the bundled ANGLE driver is used, request an OpenGL ES
-            // 3.0 context for the window. SDL chooses the window's EGL
-            // config once, at window creation, using these attributes and
-            // then reuses that config for every later context creation
-            // (SDL_EGL_CreateContext does not re-run SDL_EGL_ChooseConfig).
-            // ANGLE validates eglCreateContext against the config's
-            // EGL_RENDERABLE_TYPE and fails with EGL_BAD_MATCH when an ES
-            // 3.0 context is requested on a config that doesn't advertise
-            // EGL_OPENGL_ES3_BIT (see ValidateCreateContext in ANGLE's
-            // validationEGL.cpp). Apps that ask for ES 3.0 after the window
-            // was created with ES 1.1 attributes would therefore always
-            // fail. ES 1.1 and ES 2.0 contexts remain usable on an ES 3.0
+            // SDL chooses the window's EGL config once, at window creation,
+            // using these attributes, and then reuses that config for every
+            // later context creation (SDL_EGL_CreateContext does not re-run
+            // SDL_EGL_ChooseConfig). ANGLE validates eglCreateContext
+            // against the config's EGL_RENDERABLE_TYPE and fails with
+            // EGL_BAD_MATCH when a higher ES version is requested on a
+            // config that doesn't advertise it (see ValidateCreateContext in
+            // ANGLE's validationEGL.cpp). Some ANGLE builds or devices
+            // expose no ES 3.0 configs at all, so when the bundled ANGLE
+            // driver is used the window creation code below tries ES 3.0,
+            // then ES 2.0, then ES 1.1, and keeps the highest that works.
+            // Lower-version contexts remain usable on a higher-version
             // config: ANGLE's frontend advertises ES 1 support on all
             // configs, and ES 2 support is a subset of ES 3.
             let attr = video_ctx.gl_attr();
-            if android_angle_driver_staged() {
-                attr.set_context_version(3, 0);
-            } else {
-                attr.set_context_version(1, 1);
-            }
+            attr.set_context_version(1, 1);
             attr.set_context_profile(sdl2::video::GLProfile::GLES);
 
             // Disable blocking of event loop when app is paused.
@@ -1144,50 +1140,90 @@ impl Window {
         let portrait_screen_size =
             host_screen_size.unwrap_or_else(|| device_family.portrait_size());
 
-        let mut window = if Self::rotatable_fullscreen() {
-            // Without this, SDL will force fullscreen mode to be portrait.
-            set_sdl2_orientation(device_orientation);
-            let screen_size = video_ctx
-                .display_bounds(0)
-                .map_err(|err| format!("Could not query the display bounds: {}", err))?
-                .size();
-            let (width, height) = rotate_fullscreen_size(device_orientation, screen_size);
-            let mut window_builder = video_ctx.window(title, width, height);
-            window_builder.fullscreen().opengl();
-            // Render at the device's native (Retina) resolution.
-            #[cfg(target_os = "ios")]
-            window_builder.allow_highdpi();
-            let window = window_builder
-                .build()
-                .map_err(|err| format!("Could not create the SDL OpenGL window: {}", err))?;
-            window
-        } else if fullscreen {
-            let (width, height) = video_ctx
-                .display_bounds(0)
-                .map_err(|err| format!("Could not query the display bounds: {}", err))?
-                .size();
-            let mut window_builder = video_ctx.window(title, width, height);
-            window_builder.fullscreen_desktop().opengl();
-            #[cfg(target_os = "macos")]
-            window_builder.allow_highdpi();
-            let window = window_builder
-                .build()
-                .map_err(|err| format!("Could not create the SDL OpenGL window: {}", err))?;
-            window
+        // Wrap the window build so that, on Android with the bundled ANGLE
+        // driver, it can be retried with progressively lower ES versions
+        // until one matches an EGL config ANGLE actually exposes (see the
+        // comment on the GL attributes above).
+
+        let build_window = || -> Result<sdl2::video::Window, String> {
+            if Self::rotatable_fullscreen() {
+                // Without this, SDL will force fullscreen mode to be portrait.
+                set_sdl2_orientation(device_orientation);
+                let screen_size = video_ctx
+                    .display_bounds(0)
+                    .map_err(|err| format!("Could not query the display bounds: {}", err))?
+                    .size();
+                let (width, height) = rotate_fullscreen_size(device_orientation, screen_size);
+                let mut window_builder = video_ctx.window(title, width, height);
+                window_builder.fullscreen().opengl();
+                // Render at the device's native (Retina) resolution.
+                #[cfg(target_os = "ios")]
+                window_builder.allow_highdpi();
+                let window = window_builder
+                    .build()
+                    .map_err(|err| format!("Could not create the SDL OpenGL window: {}", err))?;
+                Ok(window)
+            } else if fullscreen {
+                let (width, height) = video_ctx
+                    .display_bounds(0)
+                    .map_err(|err| format!("Could not query the display bounds: {}", err))?
+                    .size();
+                let mut window_builder = video_ctx.window(title, width, height);
+                window_builder.fullscreen_desktop().opengl();
+                #[cfg(target_os = "macos")]
+                window_builder.allow_highdpi();
+                let window = window_builder
+                    .build()
+                    .map_err(|err| format!("Could not create the SDL OpenGL window: {}", err))?;
+                Ok(window)
+            } else {
+                let (width, height) = size_for_orientation_from_size(
+                    portrait_screen_size,
+                    device_orientation,
+                    scale_hack,
+                );
+                let mut window_builder = video_ctx.window(title, width, height);
+                window_builder.position_centered().resizable().opengl();
+                #[cfg(target_os = "macos")]
+                window_builder.allow_highdpi();
+                let window = window_builder
+                    .build()
+                    .map_err(|err| format!("Could not create the SDL OpenGL window: {}", err))?;
+                Ok(window)
+            }
+        };
+
+        let mut window = if env::consts::OS == "android" && android_angle_driver_staged() {
+            // The bundled ANGLE driver may not expose EGL configs for every
+            // ES version (e.g. no ES 3.0 configs on some devices). Try the
+            // highest version first and fall back, so ANGLE stays in use
+            // with the highest config version it supports.
+            let mut built = None;
+            let mut last_error = String::new();
+            for (major, minor) in [(3u8, 0u8), (2, 0), (1, 1)] {
+                video_ctx.gl_attr().set_context_version(major, minor);
+                match build_window() {
+                    Ok(window) => {
+                        built = Some(window);
+                        break;
+                    }
+                    Err(err) => {
+                        log!(
+                            "Bundled ANGLE has no OpenGL ES {}.{} EGL config ({}); trying a lower version.",
+                            major,
+                            minor,
+                            err
+                        );
+                        last_error = err;
+                    }
+                }
+            }
+            match built {
+                Some(window) => window,
+                None => return Err(last_error),
+            }
         } else {
-            let (width, height) = size_for_orientation_from_size(
-                portrait_screen_size,
-                device_orientation,
-                scale_hack,
-            );
-            let mut window_builder = video_ctx.window(title, width, height);
-            window_builder.position_centered().resizable().opengl();
-            #[cfg(target_os = "macos")]
-            window_builder.allow_highdpi();
-            let window = window_builder
-                .build()
-                .map_err(|err| format!("Could not create the SDL OpenGL window: {}", err))?;
-            window
+            build_window()?
         };
 
         if env::consts::OS == "android" {
@@ -1195,7 +1231,10 @@ impl Window {
             let gl_attr = video_ctx.gl_attr();
             debug_assert_eq!(gl_attr.context_profile(), sdl2::video::GLProfile::GLES);
             if android_angle_driver_staged() {
-                debug_assert_eq!(gl_attr.context_version(), (3, 0));
+                debug_assert!(matches!(
+                    gl_attr.context_version(),
+                    (3, 0) | (2, 0) | (1, 1)
+                ));
             } else {
                 debug_assert_eq!(gl_attr.context_version(), (1, 1));
             }
