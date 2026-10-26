@@ -455,6 +455,14 @@ Other options:
         This option exists for debugging black-screen / wrong-render bugs
         and adds a glGetError() round-trip per call, so it should not be
         left on for normal use.
+    --trace-msg-depth
+    --no-trace-msg-depth
+        For diagnostic builds. Whenever the objc_msgSend recursion guard
+        bails out, also dump the nested dispatch chain that led there (as
+        MSG-DEPTH-TRACE log lines). This is how you find out which chain of
+        guest messages is running away. Useful together with
+        touchHLE_options.txt on Android, where setting the
+        TOUCHHLE_TRACE_MSG_DEPTH environment variable is awkward.
 
     --gles-native / --no-gles-native
         Android only. OFF by default (and exposed as the "GLES Native" switch

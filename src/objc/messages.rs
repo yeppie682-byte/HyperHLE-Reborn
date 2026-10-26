@@ -216,8 +216,19 @@ fn ensure_class_initialized(env: &mut Environment, class_to_init: Class) {
 /// `Environment::current_thread` (read by the caller), not the host thread —
 /// hence the thread-local hash maps rather than a single counter.
 mod msg_depth {
-    pub const MAX_DEPTH: usize = 128;
-    pub const HOST_STACK_CEILING: usize = 160;
+    pub const MAX_DEPTH: usize = 512;
+    pub const HOST_STACK_CEILING: usize = 4 * MAX_DEPTH;
+
+    // Red Ball 3 (Chillingo Crystal SDK): the SDK's periodic update cycle
+    // (`CrystalPlayer/CrystalVirtualGoods startUpdating`) runs a legitimate
+    // nested dispatch chain of ~128 frames on the main guest thread — its
+    // object graph walks itself via nested objc_msgSend hops. With the
+    // original 128-frame limit that chain tripped the guard on every cycle,
+    // bailing out mid-update and eventually wedging the game after a few
+    // levels of play. 512 frames keeps the same protection against runaway
+    // guest recursion while leaving that chain (and similar SDK update
+    // graphs) plenty of headroom; the shared ceiling still protects the one
+    // host stack all multiplexed guest threads share.
 
     thread_local! {
         static DISPATCH_DEPTH: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
@@ -360,18 +371,29 @@ mod msg_depth {
         }
 
         // The shared ceiling must still protect the real host stack when many
-        // guest threads each stay under the per-thread limit.
+        // guest threads each stay under the per-thread limit. Fill 4 threads
+        // to exactly MAX_DEPTH each (the ceiling is 4 * MAX_DEPTH), then one
+        // more dispatch on a 5th thread must hit the shared ceiling.
         #[test]
         fn shared_ceiling_still_limits_total_host_stack() {
             reset_for_tests();
-            let frames_a: Vec<_> = (0..90).map(|_| enter(0, false)).collect();
-            let frames_b: Vec<_> = (0..90).map(|_| enter(1, false)).collect();
-            let (per_a, shared) = depths(0);
-            assert_eq!(per_a, 90);
-            assert_eq!(shared, 180);
-            assert_eq!(trips(per_a, shared), Some("shared host-stack ceiling"));
-            drop(frames_b);
-            drop(frames_a);
+            let mut all: Vec<Vec<_>> = Vec::new();
+            for thread in 0..4 {
+                all.push((0..MAX_DEPTH).map(|_| enter(thread, false)).collect());
+                let (per, shared) = depths(thread);
+                assert_eq!(per, MAX_DEPTH);
+                assert_eq!(shared, MAX_DEPTH * (thread + 1));
+                assert_eq!(trips(per, shared), None);
+            }
+            let extra = enter(4, false);
+            let (per, shared) = depths(4);
+            assert_eq!(per, 1);
+            assert_eq!(shared, 4 * MAX_DEPTH + 1);
+            assert_eq!(trips(per, shared), Some("shared host-stack ceiling"));
+            drop(extra);
+            for frames in all.into_iter().rev() {
+                drop(frames);
+            }
             assert_eq!(depths(0), (0, 0));
         }
 
