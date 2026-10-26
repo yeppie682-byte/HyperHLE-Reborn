@@ -235,6 +235,14 @@ pub struct Options {
     /// Log every GLES call made by the guest (via the LoggingGLES wrapper).
     /// Much noisier than `trace_gl_errors`. Diagnostic only.
     pub verbose_gles: bool,
+    /// Dump the nested `objc_msgSend` dispatch chain whenever the recursion
+    /// guard bails out (`MSG-DEPTH-TRACE` log lines). Diagnostic only.
+    ///
+    /// Defaults from the `TOUCHHLE_TRACE_MSG_DEPTH` environment variable;
+    /// `--trace-msg-depth` / `--no-trace-msg-depth` (usable from
+    /// `touchHLE_options.txt`, e.g. on Android where env vars are awkward)
+    /// override it by setting that variable before the app launches.
+    pub trace_msg_depth: bool,
     /// Prefer the vendor's native OpenGL ES driver over the bundled ANGLE
     /// libraries on Android. Defaults to `false` ("GLES Native" quick option
     /// OFF): the bundled ANGLE backend is the predictable default, since
@@ -347,6 +355,12 @@ impl Default for Options {
             ignore_gl_errors: false,
             trace_gl_errors: false,
             verbose_gles: false,
+            trace_msg_depth: std::env::var("TOUCHHLE_TRACE_MSG_DEPTH")
+                .map(|value| {
+                    let value = value.trim();
+                    value != "0" && !value.is_empty()
+                })
+                .unwrap_or(false),
             gles_native: false,
             // On Android the host GLES driver is essentially always
             // ARM Mali / Qualcomm Adreno / something equally strict,
@@ -669,6 +683,15 @@ impl Options {
             self.trace_gl_errors = true;
         } else if arg == "--no-trace-gl-errors" {
             self.trace_gl_errors = false;
+        } else if arg == "--trace-msg-depth" {
+            self.trace_msg_depth = true;
+            // objc_msgSend_inner reads this via `env_flag_cached!`, which has
+            // no `Options` access, so mirror the flag into the environment
+            // (same trick as --landscape-uiscreen-bounds). This happens well
+            // before the first dispatch.
+            std::env::set_var("TOUCHHLE_TRACE_MSG_DEPTH", "1");
+        } else if arg == "--no-trace-msg-depth" {
+            self.trace_msg_depth = false;
         } else if arg == "--verbose-gles" {
             self.verbose_gles = true;
         } else if arg == "--gles-native" {

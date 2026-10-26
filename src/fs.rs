@@ -1789,8 +1789,21 @@ impl Fs {
                         }
                     }
                     FsNode::Directory { .. } => {
-                        if write {
-                            OpenAction::Reject
+                        if write || append || truncate || create || create_new {
+                            // POSIX `open()` semantics: opening a directory
+                            // for writing (or O_CREAT/O_TRUNC) fails with
+                            // EISDIR and the guest is expected to handle
+                            // that. Red Ball 3's Chillingo Crystal SDK does
+                            // exactly this with its theme data files, so it
+                            // must get a guest-visible failure here, not a
+                            // host panic (the create-new path below would
+                            // otherwise panic in `handle_open_err` with
+                            // "Is a directory").
+                            log!(
+                                "Warning: attempt to open directory at path {:?} for writing — failing the open (EISDIR)",
+                                path
+                            );
+                            return Err(());
                         } else {
                             OpenAction::OpenDir
                         }
