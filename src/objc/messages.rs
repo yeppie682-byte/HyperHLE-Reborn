@@ -122,7 +122,6 @@ fn trace_cocos_menu(env: &mut Environment, menu: id, touch: id) {
 }
 use crate::frameworks::core_graphics::{CGPoint, CGRect, CGSize};
 
-
 /// Implements Apple's lazy `+initialize` contract:
 /// > The runtime sends `initialize` to each class in a program just before the
 /// > class, or any class that inherits from it, is sent its first message from
@@ -201,6 +200,217 @@ fn ensure_class_initialized(env: &mut Environment, class_to_init: Class) {
     regs[0..4].copy_from_slice(&saved_r0_r3);
 }
 
+/// Depth bookkeeping for the host-side `objc_msgSend` recursion guard.
+///
+/// Two limits are enforced (see the extended comment in `objc_msgSend_inner`):
+///
+/// * `MAX_DEPTH` — a per-guest-thread soft limit, preserving the original
+///   guard semantics for genuinely recursive guest code (`hitTest:` and
+///   friends).
+/// * `HOST_STACK_CEILING` — a shared ceiling across all guest threads,
+///   protecting the one host stack on which all multiplexed guest threads'
+///   host frames live.
+///
+/// All guest threads are multiplexed cooperatively onto one host thread (see
+/// `Environment::run_inner`), so the guest-thread key is
+/// `Environment::current_thread` (read by the caller), not the host thread —
+/// hence the thread-local hash maps rather than a single counter.
+mod msg_depth {
+    pub const MAX_DEPTH: usize = 128;
+    pub const HOST_STACK_CEILING: usize = 160;
+
+    thread_local! {
+        static DISPATCH_DEPTH: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+        static GUEST_DISPATCH_DEPTH: std::cell::RefCell<std::collections::HashMap<usize, usize>> =
+            std::cell::RefCell::new(std::collections::HashMap::new());
+        static GUEST_DEPTH_TRACE:
+            std::cell::RefCell<std::collections::HashMap<usize, Vec<std::string::String>>> =
+            std::cell::RefCell::new(std::collections::HashMap::new());
+    }
+
+    pub struct DepthGuard {
+        guest_thread: usize,
+        trace_depth: bool,
+    }
+
+    impl Drop for DepthGuard {
+        fn drop(&mut self) {
+            DISPATCH_DEPTH.with(|d| d.set(d.get().saturating_sub(1)));
+            GUEST_DISPATCH_DEPTH.with(|g| {
+                let mut g = g.borrow_mut();
+                if let Some(depth) = g.get_mut(&self.guest_thread) {
+                    *depth = depth.saturating_sub(1);
+                    if *depth == 0 {
+                        g.remove(&self.guest_thread);
+                    }
+                }
+            });
+            if self.trace_depth {
+                GUEST_DEPTH_TRACE.with(|t| {
+                    let mut t = t.borrow_mut();
+                    if let Some(chain) = t.get_mut(&self.guest_thread) {
+                        chain.pop();
+                        if chain.is_empty() {
+                            t.remove(&self.guest_thread);
+                        }
+                    }
+                });
+            }
+        }
+    }
+
+    /// Enter a dispatch on guest thread `guest_thread`. The returned guard
+    /// decrements the counters when dropped.
+    pub fn enter(guest_thread: usize, trace_depth: bool) -> DepthGuard {
+        DISPATCH_DEPTH.with(|d| d.set(d.get() + 1));
+        GUEST_DISPATCH_DEPTH.with(|g| {
+            let mut g = g.borrow_mut();
+            let per = *g.entry(guest_thread).or_insert(0) + 1;
+            g.insert(guest_thread, per);
+        });
+        DepthGuard {
+            guest_thread,
+            trace_depth,
+        }
+    }
+
+    /// The dispatch depth of `guest_thread` and the shared depth across all
+    /// guest threads, as seen by the in-flight dispatch.
+    pub fn depths(guest_thread: usize) -> (usize, usize) {
+        let shared = DISPATCH_DEPTH.with(|d| d.get());
+        let per = GUEST_DISPATCH_DEPTH.with(|g| *g.borrow().get(&guest_thread).unwrap_or(&0));
+        (per, shared)
+    }
+
+    /// Whether a dispatch at `(depth, shared_depth)` must bail out, and which
+    /// limit it hit (for logging and tests).
+    pub fn trips(depth: usize, shared_depth: usize) -> Option<&'static str> {
+        if depth > MAX_DEPTH {
+            Some("per-thread limit")
+        } else if shared_depth > HOST_STACK_CEILING {
+            Some("shared host-stack ceiling")
+        } else {
+            None
+        }
+    }
+
+    pub fn trace_push(guest_thread: usize, entry: std::string::String) {
+        GUEST_DEPTH_TRACE.with(|t| t.borrow_mut().entry(guest_thread).or_default().push(entry));
+    }
+
+    pub fn trace_dump(guest_thread: usize) {
+        GUEST_DEPTH_TRACE.with(|t| {
+            if let Some(chain) = t.borrow().get(&guest_thread) {
+                log!(
+                    "MSG-DEPTH-TRACE guest thread {} chain ({} levels): {}",
+                    guest_thread,
+                    chain.len(),
+                    chain.join(" -> ")
+                );
+            }
+        });
+    }
+
+    #[cfg(test)]
+    pub(crate) fn reset_for_tests() {
+        DISPATCH_DEPTH.with(|d| d.set(0));
+        GUEST_DISPATCH_DEPTH.with(|g| g.borrow_mut().clear());
+        GUEST_DEPTH_TRACE.with(|t| t.borrow_mut().clear());
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        // A guest thread pinned at the old shared counter's limit must not
+        // stop other guest threads from dispatching. This is the Red Ball 3
+        // freeze: the Crystal SDK polling worker's suspended frames kept the
+        // shared counter at 128, so every dispatch on every other thread
+        // bailed out with a nil return and the render loop stopped.
+        #[test]
+        fn wedged_thread_does_not_starve_other_guest_threads() {
+            reset_for_tests();
+            const WEDGED: usize = 77;
+            let wedged_frames: Vec<_> = (0..MAX_DEPTH).map(|_| enter(WEDGED, false)).collect();
+            assert_eq!(depths(WEDGED).0, MAX_DEPTH);
+            let shared_after_wedge = depths(WEDGED).1;
+            assert_eq!(shared_after_wedge, MAX_DEPTH);
+
+            // Old behavior: the plain shared counter at MAX_DEPTH made the
+            // very next dispatch on any thread bail out. New behavior: the
+            // per-thread soft limit only trips for the thread that is
+            // actually too deep.
+            let other = enter(1, false);
+            let (per, shared) = depths(1);
+            assert_eq!(per, 1);
+            assert_eq!(shared, shared_after_wedge + 1);
+            assert_eq!(trips(per, shared), None);
+            drop(other);
+
+            // A further dispatch on the wedged thread itself must still bail.
+            let would_trip = enter(WEDGED, false);
+            let (per, shared) = depths(WEDGED);
+            assert!(trips(per, shared).is_some());
+            drop(would_trip);
+
+            for guard in wedged_frames.into_iter().rev() {
+                drop(guard);
+            }
+            assert_eq!(depths(WEDGED), (0, 0));
+        }
+
+        // The shared ceiling must still protect the real host stack when many
+        // guest threads each stay under the per-thread limit.
+        #[test]
+        fn shared_ceiling_still_limits_total_host_stack() {
+            reset_for_tests();
+            let frames_a: Vec<_> = (0..90).map(|_| enter(0, false)).collect();
+            let frames_b: Vec<_> = (0..90).map(|_| enter(1, false)).collect();
+            let (per_a, shared) = depths(0);
+            assert_eq!(per_a, 90);
+            assert_eq!(shared, 180);
+            assert_eq!(trips(per_a, shared), Some("shared host-stack ceiling"));
+            drop(frames_b);
+            drop(frames_a);
+            assert_eq!(depths(0), (0, 0));
+        }
+
+        // After a wedged thread's frames unwind, its bookkeeping is fully
+        // cleaned up and it can dispatch normally again.
+        #[test]
+        fn bookkeeping_cleans_up_after_unwind() {
+            reset_for_tests();
+            let frames: Vec<_> = (0..40).map(|_| enter(3, false)).collect();
+            assert_eq!(depths(3), (40, 40));
+            drop(frames);
+            assert_eq!(depths(3), (0, 0));
+            let guard = enter(3, false);
+            assert_eq!(depths(3), (1, 1));
+            assert_eq!(trips(1, 1), None);
+            drop(guard);
+            assert_eq!(depths(3), (0, 0));
+        }
+
+        // Trace chains track the deepest thread independently of others and
+        // are popped correctly by the guard.
+        #[test]
+        fn trace_chain_pushes_and_pops_per_guest_thread() {
+            reset_for_tests();
+            let g0 = enter(0, true);
+            trace_push(0, "[A alloc]".to_owned());
+            let g1a = enter(1, true);
+            trace_push(1, "[B init]".to_owned());
+            let g1b = enter(1, true);
+            trace_push(1, "[B retain]".to_owned());
+            drop(g1b);
+            drop(g1a);
+            drop(g0);
+            // The dropped guards must have fully removed the chains.
+            GUEST_DEPTH_TRACE.with(|t| assert!(t.borrow().is_empty()));
+        }
+    }
+}
+
 /// The core implementation of `objc_msgSend`, the main function of Objective-C.
 ///
 /// Note that while only two parameters (usually receiver and selector) are
@@ -215,6 +425,7 @@ fn ensure_class_initialized(env: &mut Environment, class_to_init: Class) {
 /// by the method implementation.
 /// We are relying on CallFromGuest not
 /// overwriting it.
+
 #[allow(non_snake_case)]
 fn objc_msgSend_inner(
     env: &mut Environment,
@@ -239,7 +450,9 @@ fn objc_msgSend_inner(
                 let name = env.objc.get_class_name(class).to_owned();
                 log!(
                     "TRACE_ENUM: countByEnumerating call #{} receiver={:?} class={}",
-                    n, receiver, name
+                    n,
+                    receiver,
+                    name
                 );
             }
         }
@@ -255,32 +468,92 @@ fn objc_msgSend_inner(
         {
             let class_name = env.objc.get_class_name(class).to_string();
             let names = env.objc.debug_all_class_ivars_as_strings(class);
-            log!("CALLFUNC-OBJECT class={} object={:?} ivars={:?}", class_name, receiver, names);
+            log!(
+                "CALLFUNC-OBJECT class={} object={:?} ivars={:?}",
+                class_name,
+                receiver,
+                names
+            );
             for name in names {
-                let value = env.objc.object_lookup_ivar(&env.mem, receiver, &name)
+                let value = env
+                    .objc
+                    .object_lookup_ivar(&env.mem, receiver, &name)
                     .map(|pointer| env.mem.read(pointer));
-                log!("CALLFUNC-IVAR class={} object={:?} name={} value={:?}", class_name, receiver, name, value);
+                log!(
+                    "CALLFUNC-IVAR class={} object={:?} name={} value={:?}",
+                    class_name,
+                    receiver,
+                    name,
+                    value
+                );
             }
-            let callback_address = env.objc.object_lookup_ivar(&env.mem, receiver, &"_targetCallback".to_string())
+            let callback_address = env
+                .objc
+                .object_lookup_ivar(&env.mem, receiver, &"_targetCallback".to_string())
                 .map(|pointer| env.mem.read(pointer))
                 .unwrap_or(0);
             if callback_address != 0 {
                 let words: Vec<u32> = (0..6)
-                    .map(|index| env.mem.read(crate::mem::ConstPtr::<u32>::from_bits(callback_address + index * 4)))
+                    .map(|index| {
+                        env.mem.read(crate::mem::ConstPtr::<u32>::from_bits(
+                            callback_address + index * 4,
+                        ))
+                    })
                     .collect();
                 let callback_object = id::from_bits(callback_address);
                 let callback_isa = ObjC::read_isa(callback_object, &env.mem);
-                log!("CALLFUNC-BLOCK address={:#x} isa={:?} class={} words={:x?}", callback_address, callback_isa, env.objc.get_class_name(callback_isa), words);
+                log!(
+                    "CALLFUNC-BLOCK address={:#x} isa={:?} class={} words={:x?}",
+                    callback_address,
+                    callback_isa,
+                    env.objc.get_class_name(callback_isa),
+                    words
+                );
             }
         }
-        if sel_name.starts_with("addSubview") || sel_name.starts_with("insertSubview") || sel_name.starts_with("setFullscreen") || sel_name == "removeFromSuperview" || sel_name.starts_with("bringSubview") || sel_name.starts_with("sendSubview") {
+        if sel_name.starts_with("addSubview")
+            || sel_name.starts_with("insertSubview")
+            || sel_name.starts_with("setFullscreen")
+            || sel_name == "removeFromSuperview"
+            || sel_name.starts_with("bringSubview")
+            || sel_name.starts_with("sendSubview")
+        {
             let r = env.cpu.regs();
-            let arg_class = if sel_name.starts_with("setFullscreen") || r[2] == 0 || r[2] < 0x1000 { "-".to_string() } else { env.objc.get_class_name(ObjC::read_isa(crate::mem::Ptr::from_bits(r[2]), &env.mem)).to_string() };
-            log!("VIEWOP {} {:?} {} arg={:#x}({}) r3={:#x} lr={:#x}", env.objc.get_class_name(class), receiver, sel_name, r[2], arg_class, r[3], r[14]);
+            let arg_class = if sel_name.starts_with("setFullscreen") || r[2] == 0 || r[2] < 0x1000 {
+                "-".to_string()
+            } else {
+                env.objc
+                    .get_class_name(ObjC::read_isa(crate::mem::Ptr::from_bits(r[2]), &env.mem))
+                    .to_string()
+            };
+            log!(
+                "VIEWOP {} {:?} {} arg={:#x}({}) r3={:#x} lr={:#x}",
+                env.objc.get_class_name(class),
+                receiver,
+                sel_name,
+                r[2],
+                arg_class,
+                r[3],
+                r[14]
+            );
         }
-        if matches!(sel_name, "setEnabled:" | "setHidden:" | "setTitle:forState:" | "setImage:forState:" | "setBackgroundImage:forState:") && env.objc.get_class_name(class) == "UIButton" {
+        if matches!(
+            sel_name,
+            "setEnabled:"
+                | "setHidden:"
+                | "setTitle:forState:"
+                | "setImage:forState:"
+                | "setBackgroundImage:forState:"
+        ) && env.objc.get_class_name(class) == "UIButton"
+        {
             let r = env.cpu.regs();
-            log!("BTN {:?} {} arg={:#x} lr={:#x}", receiver, sel_name, r[2], r[14]);
+            log!(
+                "BTN {:?} {} arg={:#x} lr={:#x}",
+                receiver,
+                sel_name,
+                r[2],
+                r[14]
+            );
         }
         if SEEN
             .lock()
@@ -325,23 +598,48 @@ fn objc_msgSend_inner(
     // limit keeps us well clear of Android's 1 MB default thread stack
     // (each `objc_msgSend_inner` host frame is several KB once Rust adds
     // local variables, log!() temporaries, and the dispatch trampoline).
-    const MAX_DEPTH: usize = 128;
-    thread_local! {
-        static DISPATCH_DEPTH: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    //
+    // All guest threads are multiplexed cooperatively onto this one host
+    // thread (see `Environment::run_inner`), so a plain thread-local counter
+    // is shared by every guest thread. A guest thread that blocks while
+    // nested inside a dispatch (a semaphore wait, a run-loop wait, ...) keeps
+    // its host frames alive on the shared host stack, so its depth
+    // contribution stays counted while it is suspended. Charging the whole
+    // budget to the shared counter lets one wedged guest thread starve every
+    // other thread's dispatches: observed in Red Ball 3 (Chillingo Crystal
+    // SDK), where the SDK's polling worker pins the counter around 128, every
+    // dispatch on every thread then bails out with a nil return, the main
+    // thread's render loop stops presenting frames, and the game freezes
+    // while the CPU keeps spinning.
+    //
+    // We therefore enforce two limits:
+    //   * a per-guest-thread soft limit (`MAX_DEPTH`), which keeps the
+    //     original semantics for genuinely recursive guest code (`hitTest:`
+    //     and friends); and
+    //   * a shared hard ceiling (`HOST_STACK_CEILING`) that still protects
+    //     the real host stack, which all multiplexed guest frames share. The
+    //     ceiling is only slightly above a single thread's soft limit, so the
+    //     worst-case host stack usage is barely more than before.
+    // The actual bookkeeping lives in [msg_depth] so it can be unit-tested
+    // in isolation (see `msg_depth::tests`).
+    let guest_thread = env.current_thread;
+    let trace_depth = crate::env_flag_cached!("TOUCHHLE_TRACE_MSG_DEPTH");
+    if trace_depth {
+        // Debug-only: record the nested dispatch chain for this guest thread
+        // so that a trip can dump the full path that led here.
+        let class_name = if receiver == nil {
+            "(nil)".to_owned()
+        } else {
+            env.objc
+                .get_class_name(ObjC::read_isa(receiver, &env.mem))
+                .to_owned()
+        };
+        let entry = format!("[{} {}]", class_name, selector.as_str(&env.mem));
+        msg_depth::trace_push(guest_thread, entry);
     }
-    let depth = DISPATCH_DEPTH.with(|d| {
-        let new = d.get() + 1;
-        d.set(new);
-        new
-    });
-    struct DepthGuard;
-    impl Drop for DepthGuard {
-        fn drop(&mut self) {
-            DISPATCH_DEPTH.with(|d| d.set(d.get().saturating_sub(1)));
-        }
-    }
-    let _guard = DepthGuard;
-    if depth > MAX_DEPTH {
+    let _guard = msg_depth::enter(guest_thread, trace_depth);
+    let (depth, shared_depth) = msg_depth::depths(guest_thread);
+    if let Some(trip_reason) = msg_depth::trips(depth, shared_depth) {
         let sel_name = selector.as_str(&env.mem).to_string();
 
         if env.bundle.bundle_identifier() == "com.tayasui.mrpoofree"
@@ -362,12 +660,35 @@ fn objc_msgSend_inner(
                 sel_name
             );
         }
-        log!(
-            "Warning: objc_msgSend recursion limit ({}) exceeded while dispatching \"{}\" to {:?}; bailing out with a nil return.",
-            MAX_DEPTH,
-            sel_name,
-            receiver,
-        );
+        // Rate-limit the warning: a wedged app can hit this thousands of
+        // times per second (Red Ball 3 logged ~700,000 of these in one
+        // session), which floods the log and slows the emulator down.
+        use std::sync::atomic::{AtomicU32, Ordering};
+        static BAIL_LOG_COUNT: AtomicU32 = AtomicU32::new(0);
+        let bail_count = BAIL_LOG_COUNT.fetch_add(1, Ordering::Relaxed);
+        if trace_depth {
+            // Root-cause aid: dump the complete nested dispatch chain of this
+            // guest thread. The chain grows exactly like the dispatch depth,
+            // so it shows precisely which selector path recurses.
+            msg_depth::trace_dump(guest_thread);
+        }
+        if bail_count < 24 || bail_count.is_multiple_of(16384) {
+            log!(
+                "Warning: objc_msgSend recursion {} exceeded while dispatching \"{}\" to {:?}; bailing out with a nil return. (guest thread {} at depth {}/{}, {}/{} frames on the shared host stack)",
+                trip_reason,
+                sel_name,
+                receiver,
+                guest_thread,
+                depth,
+                msg_depth::MAX_DEPTH,
+                shared_depth,
+                msg_depth::HOST_STACK_CEILING,
+            );
+        } else if bail_count == 24 {
+            log!(
+                "Warning: suppressing further objc_msgSend recursion-limit warnings (run with TOUCHHLE_TRACE_MSG_DEPTH=1 to trace the nested dispatch chain)."
+            );
+        }
         // Special handling for allocWithZone: — if recursion is hit during
         // allocation, perform the allocation directly using NSObject's
         // fallback path rather than returning nil (which causes cascading
@@ -1069,7 +1390,10 @@ Type mismatch when sending message {} to {:?}!
         } else {
             let sel_name = selector.as_str(&env.mem).to_owned();
             let class_name = env.objc.try_get_class_name(class).map(|s| s.to_owned());
-            let orig_name = env.objc.try_get_class_name(orig_class).map(|s| s.to_owned());
+            let orig_name = env
+                .objc
+                .try_get_class_name(orig_class)
+                .map(|s| s.to_owned());
             let type_name = host_object.type_name();
             log!(
                 "Item {class:?} ({:?}) in superclass chain of object {receiver:?}'s class {orig_class:?} ({:?}) has an unexpected host object type ({}). Selector: \"{}\". Behaving as if message was sent to nil.",
@@ -2526,11 +2850,8 @@ pub(super) fn objc_enumerationMutation(env: &mut Environment, obj: id) {
     let seen = guard.get_or_insert_with(Default::default);
     if seen.insert(class) {
         let name = env.objc.get_class_name(class).to_owned();
-        let count: crate::frameworks::foundation::NSUInteger = if obj != nil {
-            msg![env; obj count]
-        } else {
-            0
-        };
+        let count: crate::frameworks::foundation::NSUInteger =
+            if obj != nil { msg![env; obj count] } else { 0 };
         log!(
             "objc_enumerationMutation: collection {:?} (class {}) mutated while \
              being enumerated (count now {})",
